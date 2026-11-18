@@ -93,7 +93,7 @@ public class BridgeService extends Service implements SensorEventListener {
                 android.util.Log.i(TAG, "listening on " + PORT);
                 while (true) {
                     Socket client = serverSocket.accept();
-                    android.util.Log.i(TAG, "client connected: " + client.getRemoteAddress());
+                    android.util.Log.i(TAG, "client connected: " + client.getRemoteSocketAddress());
                     new Thread(() -> handle(client), "client").start();
                 }
             } catch (IOException e) {

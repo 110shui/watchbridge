@@ -294,17 +294,22 @@ public class BridgeService extends Service implements SensorEventListener {
             if (rs[lag] > bestR) { bestR = rs[lag]; bestLag = lag; }
         }
         if (bestLag < 0) return;
+        // 信号质量：归一化自相关系数过低说明噪声主导（未贴紧/无脉搏）
+        float rNorm = bestR / (energy / m);
+        if (rNorm < 0.25f) { android.util.Log.i(TAG, "ppg quality low: " + rNorm); return; }
         // 能量太低说明未佩戴/信号无效
         float amp = (float) Math.sqrt(energy / m);
         if (amp < 500) { android.util.Log.i(TAG, "ppg amp too low: " + amp); return; }
-        // 抛物线插值细化峰位
+        // 抛物线插值细化峰位（delta 约束在 ±0.5 内，防止飞出 lag 邻域）
         float lagF = bestLag;
         if (bestLag > 2 && bestLag < 7) {
             float y0 = rs[bestLag - 1], y1 = rs[bestLag], y2 = rs[bestLag + 1];
             float denom = (y0 - 2 * y1 + y2);
             if (Math.abs(denom) > 1e-9f) {
                 float delta = 0.5f * (y0 - y2) / denom;
-                if (delta > -1 && delta < 1) lagF = bestLag + delta;
+                if (delta > 0.5f) delta = 0.5f;
+                if (delta < -0.5f) delta = -0.5f;
+                lagF = bestLag + delta;
             }
         }
         // 实际采样间隔

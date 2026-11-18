@@ -61,6 +61,9 @@ public class BridgeService extends Service implements SensorEventListener {
     static volatile long hrIntervalSec = 30;    // 心率自动测定间隔
     static volatile long spo2IntervalSec = 60;  // 血氧自动测定间隔
 
+    // 常驻计步器（加速度计，不受白名单限制）
+    StepCounter stepCounter;
+
     // 所有客户端输出流（手表→手机命令广播用）
     static final java.util.concurrent.CopyOnWriteArrayList<OutputStream> clientOuts =
             new java.util.concurrent.CopyOnWriteArrayList<>();
@@ -87,6 +90,8 @@ public class BridgeService extends Service implements SensorEventListener {
         startForegroundNotification();
         sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
         recordStore = new RecordStore(getFilesDir());
+        stepCounter = new StepCounter(sensorManager, this);
+        stepCounter.start();   // 常驻计步（前台服务期间连续）
         try {
             android.content.SharedPreferences p = getSharedPreferences("bridge", MODE_PRIVATE);
             hrIntervalSec = Math.max(15, p.getLong("hrInterval", 30));
@@ -228,8 +233,9 @@ public class BridgeService extends Service implements SensorEventListener {
                 computeHrFromPpg();   // PPG 自相关估计心率
                 float hr = latestHeartRate;
                 long hrAge = lastHrAt == 0 ? -1 : System.currentTimeMillis() - lastHrAt;
+                int steps = Math.max(stepCounter.todaySteps(), (int) cumulativeSteps);
                 String json = "{\"hr\":" + (hrAge >= 0 && hrAge < 120000 ? (int) hr : 0)
-                        + ",\"steps\":" + (int) cumulativeSteps
+                        + ",\"steps\":" + steps
                         + ",\"spo2Raw\":" + (int) lastSpo2
                         + ",\"spo2\":" + (int) lastSpo2Pct
                         + ",\"worn\":" + (worn ? 1 : 0)
@@ -541,6 +547,7 @@ public class BridgeService extends Service implements SensorEventListener {
 
     @Override
     public void onDestroy() {
+        if (stepCounter != null) stepCounter.stop();
         if (serverThread != null) serverThread.interrupt();
         if (samplerThread != null) samplerThread.interrupt();
         try { sensorManager.unregisterListener(this); } catch (Throwable ignored) {}

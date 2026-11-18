@@ -85,6 +85,7 @@ public class BridgeService extends Service implements SensorEventListener {
 
             startSampling();
             sleep(window);
+            computeHrFromPpg();   // 窗口结束前算一次，无客户端也可记录
             stopSampling();
 
             // 等待期：每秒检查客户端上线，一旦上线立即缩短等待（1 秒内开下一个窗口）

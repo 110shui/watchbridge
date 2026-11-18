@@ -31,7 +31,11 @@ public class MainActivity extends Activity {
         else startService(svc);
 
         String ip = getIp();
-        tv.setText("OHealth 数据桥已启动\n\n端口: 9999\n手表 IP: " + ip
+        String ver = "unknown";
+        try {
+            ver = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception ignored) {}
+        tv.setText("OHealth 数据桥 v" + ver + "（已运行）\n\n端口: 9999\n手表 IP: " + ip
                 + "\n\niPhone 连接地址: " + ip + ":9999\n\n传感器数据每 3 秒推送一次 (JSON)\n"
                 + "提示：手表需佩戴并保持与 iPhone 同一 WiFi");
         setContentView(tv);

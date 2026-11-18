@@ -38,7 +38,7 @@ public final class HealthKitClient {
         byte[] b = v.getBytes();
         writeVarint(out, (field << 3) | 2);
         writeVarint(out, b.length);
-        out.writeBytes(b, 0, b.length);
+        out.write(b, 0, b.length);
     }
 
     static void writeVarintField(ByteArrayOutputStream out, int field, long v) {

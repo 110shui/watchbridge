@@ -98,6 +98,16 @@ public class BridgeService extends Service implements SensorEventListener {
         try {
             register(Sensor.TYPE_HEART_RATE);
             register(Sensor.TYPE_STEP_COUNTER);
+            // 优先注册厂商芯片级心率 max86178_hr (65597)——不受 SensorService 白名单限制
+            boolean hrSensorFound = false;
+            for (Sensor s : sensorManager.getSensorList(-1)) {
+                if (s.getType() == 65597) {
+                    sensorManager.registerListener(this, s, SensorManager.SENSOR_DELAY_NORMAL);
+                    hrSensorFound = true;
+                    android.util.Log.i(TAG, "registered " + s.getName() + " vendor=" + s.getVendor());
+                }
+            }
+            android.util.Log.i(TAG, "max86178_hr found=" + hrSensorFound);
             Sensor spo2 = sensorManager.getDefaultSensor(65596);
             if (spo2 != null) sensorManager.registerListener(this, spo2, SensorManager.SENSOR_DELAY_NORMAL);
         } catch (Throwable t) {
@@ -203,13 +213,19 @@ public class BridgeService extends Service implements SensorEventListener {
 
     @Override
     public void onSensorChanged(SensorEvent event) {
-        if (event.sensor.getType() == Sensor.TYPE_HEART_RATE && event.values.length > 0) {
-            latestHeartRate = event.values[0];
-            lastHrAt = System.currentTimeMillis();
-            android.util.Log.i(TAG, "hr=" + latestHeartRate);
-        } else if (event.sensor.getType() == Sensor.TYPE_STEP_COUNTER && event.values.length > 0) {
+        int type = event.sensor.getType();
+        if (event.values.length == 0) return;
+        // 仅有效值(>0)才刷新时间戳，避免 0.0 心率造成"假新鲜"数据
+        if (type == Sensor.TYPE_HEART_RATE || type == 65597 /* max86178_hr */) {
+            float v = event.values[0];
+            if (v > 0) {
+                latestHeartRate = v;
+                lastHrAt = System.currentTimeMillis();
+                android.util.Log.i(TAG, "hr(type" + type + ")=" + latestHeartRate);
+            }
+        } else if (type == Sensor.TYPE_STEP_COUNTER && event.values[0] > 0) {
             cumulativeSteps = event.values[0];
-        } else if (event.sensor.getType() == 65596 && event.values.length > 0) {
+        } else if (type == 65596) {
             lastSpo2 = event.values[0];
         }
     }

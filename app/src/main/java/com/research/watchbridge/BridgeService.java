@@ -86,23 +86,28 @@ public class BridgeService extends Service implements SensorEventListener {
     }
 
     void serve() {
+        android.util.Log.i(TAG, "server starting on " + PORT);
         while (!Thread.currentThread().isInterrupted()) {
             try {
                 serverSocket = new ServerSocket(PORT);
+                android.util.Log.i(TAG, "listening on " + PORT);
                 while (true) {
                     Socket client = serverSocket.accept();
+                    android.util.Log.i(TAG, "client connected: " + client.getRemoteAddress());
                     new Thread(() -> handle(client), "client").start();
                 }
             } catch (IOException e) {
+                android.util.Log.w(TAG, "serve error: " + e);
                 sleep(2000);
             }
         }
     }
 
+    static final String TAG = "BridgeService";
+
     void handle(Socket client) {
         try {
             OutputStream out = client.getOutputStream();
-            client.getInputStream().read(new byte[64]); // 等首个包（握手）
             SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US);
             f.setTimeZone(TimeZone.getDefault());
             while (!client.isClosed()) {
@@ -117,7 +122,8 @@ public class BridgeService extends Service implements SensorEventListener {
                 out.flush();
                 Thread.sleep(3000);
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            android.util.Log.w(TAG, "handle error: " + e);
         } finally {
             try { client.close(); } catch (IOException ignored) {}
         }

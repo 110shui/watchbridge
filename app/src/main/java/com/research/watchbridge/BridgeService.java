@@ -242,10 +242,14 @@ public class BridgeService extends Service implements SensorEventListener {
             worn = event.values[0] > 0.5f;
             android.util.Log.i(TAG, "offbody worn=" + worn);
         }
-        // PPG 波形入缓冲（max86178_hr）
+        // PPG 波形入缓冲（max86178_hr），去重：80ms 内的重复事件丢弃
         if (type == 65597 && event.values.length > 0) {
             synchronized (ppgLock) {
-                ppgBuf.addLast(new float[]{event.timestamp / 1000000000f, event.values[0]});
+                float ts = event.timestamp / 1000000000f;
+                float[] last = ppgBuf.isEmpty() ? null : ppgBuf.peekLast();
+                if (last != null && ts - last[0] < 0.08f && event.values[0] == last[1]) return;
+                if (last != null && ts - last[0] < 0.02f) return;
+                ppgBuf.addLast(new float[]{ts, event.values[0]});
                 while (ppgBuf.size() > PPG_BUF_MAX) ppgBuf.removeFirst();
             }
         }
@@ -282,12 +286,17 @@ public class BridgeService extends Service implements SensorEventListener {
         float energy = 0;
         for (int i = 0; i < m; i++) energy += x2[i] * x2[i];
         if (energy < 1e-6f) return;
-        // 自相关，lag 2..7（0.4s-1.4s → 43-150 bpm @5Hz）
+        // 自相关：lag 范围按实际采样间隔动态计算（心率 40-180bpm）
         float[] dt = new float[m];
         for (int i = 1; i < m; i++) dt[i] = d[start + i][0] - d[start][0];
+        float step = dt[m - 1] / (m - 1);
+        if (step <= 0) return;
+        int lagMin = Math.max(2, (int) (0.33f / step));
+        int lagMax = Math.min(60, (int) (1.5f / step) + 1);
+        if (lagMax - lagMin < 2) return;
         float bestR = -Float.MAX_VALUE; int bestLag = -1;
-        float[] rs = new float[8];
-        for (int lag = 2; lag <= 7; lag++) {
+        float[] rs = new float[62];
+        for (int lag = lagMin; lag <= lagMax; lag++) {
             float r = 0; int cnt = 0;
             for (int i = 0; i + lag < m; i++) { r += x2[i] * x2[i + lag]; cnt++; }
             rs[lag] = r / Math.max(1, cnt);
@@ -302,7 +311,7 @@ public class BridgeService extends Service implements SensorEventListener {
         if (amp < 500) { android.util.Log.i(TAG, "ppg amp too low: " + amp); return; }
         // 抛物线插值细化峰位（delta 约束在 ±0.5 内，防止飞出 lag 邻域）
         float lagF = bestLag;
-        if (bestLag > 2 && bestLag < 7) {
+        if (bestLag > lagMin && bestLag < lagMax) {
             float y0 = rs[bestLag - 1], y1 = rs[bestLag], y2 = rs[bestLag + 1];
             float denom = (y0 - 2 * y1 + y2);
             if (Math.abs(denom) > 1e-9f) {
@@ -312,8 +321,6 @@ public class BridgeService extends Service implements SensorEventListener {
                 lagF = bestLag + delta;
             }
         }
-        // 实际采样间隔
-        float step = dt[m - 1] / (m - 1);
         float periodSec = lagF * step;
         float bpm = 60f / periodSec;
         if (bpm >= 40 && bpm <= 180) {

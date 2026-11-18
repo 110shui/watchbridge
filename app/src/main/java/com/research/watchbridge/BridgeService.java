@@ -76,12 +76,19 @@ public class BridgeService extends Service implements SensorEventListener {
         while (!Thread.currentThread().isInterrupted()) {
             boolean online = activeClients.get() > 0;
             long window = online ? WINDOW_ACTIVE_MS : WINDOW_IDLE_MS;
-            long gap = online ? GAP_ACTIVE_MS : GAP_IDLE_MS;
 
             startSampling();
             sleep(window);
             stopSampling();
-            sleep(gap);
+
+            // 等待期：每秒检查客户端上线，一旦上线立即缩短等待（1 秒内开下一个窗口）
+            long gapStart = System.currentTimeMillis();
+            long maxGap = online ? GAP_ACTIVE_MS : GAP_IDLE_MS;
+            while (System.currentTimeMillis() - gapStart < maxGap) {
+                boolean nowOnline = activeClients.get() > 0;
+                if (nowOnline != online) break;   // 连接状态变化 → 立即进入下一轮
+                sleep(1000);
+            }
         }
     }
 

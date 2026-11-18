@@ -1,0 +1,27 @@
+name: build-apk
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Build debug APK
+        run: |
+          gradle -v || true
+          gradle assembleDebug --no-daemon -x lint
+      - name: Package
+        run: |
+          find app/build/outputs -name "*.apk" -exec cp {} ./watchbridge.apk \;
+          ls -la watchbridge.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: watchbridge-apk
+          path: watchbridge.apk

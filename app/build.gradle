@@ -1,0 +1,26 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace 'com.research.watchbridge'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.research.watchbridge"
+        minSdk 30
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    lint {
+        abortOnError false
+    }
+}
+
+dependencies {}

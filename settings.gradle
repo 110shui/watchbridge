@@ -1,0 +1,3 @@
+rootProject.name = 'watchbridge'
+include ':app'
+android.useAndroidX=false

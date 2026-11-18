@@ -216,9 +216,10 @@ public class BridgeService extends Service implements SensorEventListener {
         try {
             out = client.getOutputStream();
             clientOuts.add(out);
+            final OutputStream outF = out;
             BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream()));
             // 读命令线程（手机→手表：RECORDS/MEASURE/CONFIG）
-            Thread reader = new Thread(() -> readLoop(client, in, out), "reader-" + client.getPort());
+            Thread reader = new Thread(() -> readLoop(client, in, outF), "reader-" + client.getPort());
             reader.start();
             // 写数据循环（每 3 秒推送状态）
             SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US);

@@ -303,6 +303,11 @@ public class BridgeService extends Service implements SensorEventListener {
             if (rs[lag] > bestR) { bestR = rs[lag]; bestLag = lag; }
         }
         if (bestLag < 0) return;
+        // 谐波跳过：r[2*lag] 接近 r[lag] 时优先低频（防止 75bpm 被估成 150bpm）
+        while (bestLag * 2 <= lagMax && rs[bestLag * 2] >= 0.85f * bestR) {
+            bestLag *= 2;
+            bestR = rs[bestLag];
+        }
         // 信号质量：归一化自相关系数过低说明噪声主导（未贴紧/无脉搏）
         float rNorm = bestR / (energy / m);
         if (rNorm < 0.25f) { android.util.Log.i(TAG, "ppg quality low: " + rNorm); return; }

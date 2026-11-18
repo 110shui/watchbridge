@@ -51,6 +51,12 @@ public class BridgeService extends Service implements SensorEventListener {
     volatile float lastSpo2 = 0f;
     volatile long lastHrAt = 0;
     volatile boolean sampling = false;
+    volatile boolean worn = false;
+
+    // PPG 原始波形缓冲（max86178_hr 65597），用于自相关心率估计
+    static final int PPG_BUF_MAX = 128;              // ~25 秒 @5Hz
+    final java.util.ArrayDeque<float[]> ppgBuf = new java.util.ArrayDeque<>(); // [tsSec, value]
+    final Object ppgLock = new Object();
 
     final AtomicInteger activeClients = new AtomicInteger(0);
 
@@ -98,6 +104,7 @@ public class BridgeService extends Service implements SensorEventListener {
         try {
             register(Sensor.TYPE_HEART_RATE);
             register(Sensor.TYPE_STEP_COUNTER);
+            register(34); // 佩戴检测
             // 优先注册厂商芯片级心率 max86178_hr (65597)——不受 SensorService 白名单限制
             boolean hrSensorFound = false;
             for (Sensor s : sensorManager.getSensorList(-1)) {
@@ -120,6 +127,7 @@ public class BridgeService extends Service implements SensorEventListener {
     void stopSampling() {
         sampling = false;
         try { sensorManager.unregisterListener(this); } catch (Throwable ignored) {}
+        synchronized (ppgLock) { ppgBuf.clear(); }
         android.util.Log.i(TAG, "sampling window closed");
     }
 
@@ -182,14 +190,16 @@ public class BridgeService extends Service implements SensorEventListener {
         try {
             OutputStream out = client.getOutputStream();
             SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US);
-            f.setTimeZone(TimeZone.getDefault());
-            while (!client.isClosed()) {
-                float hr = latestHeartRate;
-                long hrAge = lastHrAt == 0 ? -1 : System.currentTimeMillis() - lastHrAt;
-                String json = "{\"hr\":" + (hrAge >= 0 && hrAge < 120000 ? (int) hr : 0)
-                        + ",\"steps\":" + (int) cumulativeSteps
-                        + ",\"spo2Raw\":" + (int) lastSpo2
-                        + ",\"hrAgeMs\":" + hrAge
+                f.setTimeZone(TimeZone.getDefault());
+                while (!client.isClosed()) {
+                    computeHrFromPpg();   // PPG 自相关估计心率
+                    float hr = latestHeartRate;
+                    long hrAge = lastHrAt == 0 ? -1 : System.currentTimeMillis() - lastHrAt;
+                    String json = "{\"hr\":" + (hrAge >= 0 && hrAge < 120000 ? (int) hr : 0)
+                            + ",\"steps\":" + (int) cumulativeSteps
+                            + ",\"spo2Raw\":" + (int) lastSpo2
+                            + ",\"worn\":" + (worn ? 1 : 0)
+                            + ",\"hrAgeMs\":" + hrAge
                         + ",\"hk\":\"" + HealthKitClient.lastStatus.replace("\"", "'")
                         + "\",\"clients\":" + activeClients.get()
                         + ",\"ts\":\"" + f.format(new Date()) + "\"}\n";
@@ -227,6 +237,85 @@ public class BridgeService extends Service implements SensorEventListener {
             cumulativeSteps = event.values[0];
         } else if (type == 65596) {
             lastSpo2 = event.values[0];
+        } else if (type == 34 /* LOW_LATENCY_OFFBODY_DETECT */) {
+            worn = event.values[0] > 0.5f;
+            android.util.Log.i(TAG, "offbody worn=" + worn);
+        }
+        // PPG 波形入缓冲（max86178_hr）
+        if (type == 65597 && event.values.length > 0) {
+            synchronized (ppgLock) {
+                ppgBuf.addLast(new float[]{event.timestamp / 1000000000f, event.values[0]});
+                while (ppgBuf.size() > PPG_BUF_MAX) ppgBuf.removeFirst();
+            }
+        }
+    }
+
+    // ---------------- PPG 自相关心率估计 ----------------
+    // 5Hz 采样：去趋势 + 自相关求周期，抛物线插值细化，输出 40-180 bpm
+    void computeHrFromPpg() {
+        float[][] d;
+        synchronized (ppgLock) {
+            if (ppgBuf.size() < 40) return;          // <8 秒数据不计算
+            d = ppgBuf.toArray(new float[0][]);
+        }
+        int n = d.length;
+        // 只取最近 12 秒
+        float tEnd = d[n - 1][0];
+        int start = 0;
+        while (start < n - 1 && tEnd - d[start][0] > 12f) start++;
+        int m = n - start;
+        if (m < 40) return;
+        float[] x = new float[m];
+        float mean = 0;
+        for (int i = 0; i < m; i++) { x[i] = d[start + i][1]; mean += x[i]; }
+        mean /= m;
+        // 去趋势：滑动均值（约 3 秒 = 15 点）
+        float[] x2 = new float[m];
+        for (int i = 0; i < m; i++) {
+            int a = Math.max(0, i - 7), b = Math.min(m - 1, i + 7);
+            float lm = 0;
+            for (int j = a; j <= b; j++) lm += x[j];
+            x2[i] = x[i] - lm / (b - a + 1);
+        }
+        // 归一化能量
+        float energy = 0;
+        for (int i = 0; i < m; i++) energy += x2[i] * x2[i];
+        if (energy < 1e-6f) return;
+        // 自相关，lag 2..7（0.4s-1.4s → 43-150 bpm @5Hz）
+        float[] dt = new float[m];
+        for (int i = 1; i < m; i++) dt[i] = d[start + i][0] - d[start][0];
+        float bestR = -Float.MAX_VALUE; int bestLag = -1;
+        float[] rs = new float[8];
+        for (int lag = 2; lag <= 7; lag++) {
+            float r = 0; int cnt = 0;
+            for (int i = 0; i + lag < m; i++) { r += x2[i] * x2[i + lag]; cnt++; }
+            rs[lag] = r / Math.max(1, cnt);
+            if (rs[lag] > bestR) { bestR = rs[lag]; bestLag = lag; }
+        }
+        if (bestLag < 0) return;
+        // 能量太低说明未佩戴/信号无效
+        float amp = (float) Math.sqrt(energy / m);
+        if (amp < 500) { android.util.Log.i(TAG, "ppg amp too low: " + amp); return; }
+        // 抛物线插值细化峰位
+        float lagF = bestLag;
+        if (bestLag > 2 && bestLag < 7) {
+            float y0 = rs[bestLag - 1], y1 = rs[bestLag], y2 = rs[bestLag + 1];
+            float denom = (y0 - 2 * y1 + y2);
+            if (Math.abs(denom) > 1e-9f) {
+                float delta = 0.5f * (y0 - y2) / denom;
+                if (delta > -1 && delta < 1) lagF = bestLag + delta;
+            }
+        }
+        // 实际采样间隔
+        float step = dt[m - 1] / (m - 1);
+        float periodSec = lagF * step;
+        float bpm = 60f / periodSec;
+        if (bpm >= 40 && bpm <= 180) {
+            latestHeartRate = bpm;
+            lastHrAt = System.currentTimeMillis();
+            android.util.Log.i(TAG, "ppg-hr=" + (int) bpm + " amp=" + (int) amp + " step=" + step);
+        } else {
+            android.util.Log.i(TAG, "ppg-hr out of range: " + bpm);
         }
     }
 

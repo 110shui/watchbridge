@@ -8,8 +8,8 @@ android {
         applicationId "com.research.watchbridge"
         minSdk 30
         targetSdk 34
-        versionCode 11
-        versionName "1.6-sync-remote"
+        versionCode 12
+        versionName "1.6.1-sync"
     }
 
     buildTypes {

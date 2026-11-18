@@ -368,7 +368,9 @@ public class BridgeService extends Service implements SensorEventListener {
         int type = event.sensor.getType();
         if (event.values.length == 0) return;
         // 仅有效值(>0)才刷新时间戳，避免 0.0 心率造成"假新鲜"数据
-        if (type == Sensor.TYPE_HEART_RATE || type == 65597 /* max86178_hr */) {
+        // 注意：65597 是原始 PPG 波形（几十万级 ADC），只入缓冲不进 latestHeartRate；
+        // TYPE_HEART_RATE(21) 是官方算法 bpm（有输出时优先用它）
+        if (type == Sensor.TYPE_HEART_RATE) {
             float v = event.values[0];
             if (v > 0) {
                 latestHeartRate = v;
@@ -477,6 +479,8 @@ public class BridgeService extends Service implements SensorEventListener {
         float periodSec = lagF * step;
         float bpm = 60f / periodSec;
         if (bpm >= 40 && bpm <= 180) {
+            // 官方 TYPE_HEART_RATE 值活跃（10 秒内）时不覆盖
+            if (System.currentTimeMillis() - lastHrAt < 10000 && lastHrAt > 0) return;
             latestHeartRate = bpm;
             lastHrAt = System.currentTimeMillis();
             android.util.Log.i(TAG, "ppg-hr=" + (int) bpm + " amp=" + (int) amp + " step=" + step);

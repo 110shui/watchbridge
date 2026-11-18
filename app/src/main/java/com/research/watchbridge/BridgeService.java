@@ -104,6 +104,7 @@ public class BridgeService extends Service implements SensorEventListener {
             android.util.Log.w(TAG, "startSampling: " + t);
         }
         android.util.Log.i(TAG, "sampling window open (clients=" + activeClients.get() + ")");
+        HealthKitClient.probe(this);
     }
 
     void stopSampling() {
@@ -179,7 +180,8 @@ public class BridgeService extends Service implements SensorEventListener {
                         + ",\"steps\":" + (int) cumulativeSteps
                         + ",\"spo2Raw\":" + (int) lastSpo2
                         + ",\"hrAgeMs\":" + hrAge
-                        + ",\"clients\":" + activeClients.get()
+                        + ",\"hk\":\"" + HealthKitClient.lastStatus.replace("\"", "'")
+                        + "\",\"clients\":" + activeClients.get()
                         + ",\"ts\":\"" + f.format(new Date()) + "\"}\n";
                 out.write(json.getBytes());
                 out.flush();

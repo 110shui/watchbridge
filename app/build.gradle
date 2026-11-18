@@ -8,8 +8,8 @@ android {
         applicationId "com.research.watchbridge"
         minSdk 30
         targetSdk 34
-        versionCode 3
-        versionName "1.2-sampler"
+        versionCode 4
+        versionName "1.3-healthkit"
     }
 
     buildTypes {

@@ -13,7 +13,9 @@ import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
 import android.os.IBinder;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -49,9 +51,23 @@ public class BridgeService extends Service implements SensorEventListener {
     volatile float latestHeartRate = 0f;
     volatile float cumulativeSteps = 0f;
     volatile float lastSpo2 = 0f;
+    volatile float lastSpo2Pct = 0f;      // 合成血氧百分比（0=无有效值）
     volatile long lastHrAt = 0;
     volatile boolean sampling = false;
     volatile boolean worn = false;
+
+    // 记录存储（手表端健康记录）
+    RecordStore recordStore;
+    static volatile long hrIntervalSec = 30;    // 心率自动测定间隔
+    static volatile long spo2IntervalSec = 60;  // 血氧自动测定间隔
+
+    // 所有客户端输出流（手表→手机命令广播用）
+    static final java.util.concurrent.CopyOnWriteArrayList<OutputStream> clientOuts =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    // SpO2 原始双通道缓冲（65596），用于合成血氧百分比
+    final java.util.ArrayDeque<float[]> spo2Buf = new java.util.ArrayDeque<>(); // [tsSec, ch0, ch1]
+    static final int SPO2_BUF_MAX = 128;
 
     // PPG 原始波形缓冲（max86178_hr 65597），用于自相关心率估计
     static final int PPG_BUF_MAX = 128;              // ~25 秒 @5Hz
@@ -70,6 +86,12 @@ public class BridgeService extends Service implements SensorEventListener {
         super.onCreate();
         startForegroundNotification();
         sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
+        recordStore = new RecordStore(getFilesDir());
+        try {
+            android.content.SharedPreferences p = getSharedPreferences("bridge", MODE_PRIVATE);
+            hrIntervalSec = Math.max(15, p.getLong("hrInterval", 30));
+            spo2IntervalSec = Math.max(15, p.getLong("spo2Interval", 60));
+        } catch (Throwable ignored) {}
         serverThread = new Thread(this::serve, "tcp-server");
         serverThread.start();
         samplerThread = new Thread(this::sampler, "sampler");
@@ -86,6 +108,8 @@ public class BridgeService extends Service implements SensorEventListener {
             startSampling();
             sleep(window);
             computeHrFromPpg();   // 窗口结束前算一次，无客户端也可记录
+            computeSpo2();
+            recordMeasurements(false); // 按测定间隔落库（自动测定）
             stopSampling();
 
             // 等待期：每秒检查客户端上线，一旦上线立即缩短等待（1 秒内开下一个窗口）
@@ -128,7 +152,7 @@ public class BridgeService extends Service implements SensorEventListener {
     void stopSampling() {
         sampling = false;
         try { sensorManager.unregisterListener(this); } catch (Throwable ignored) {}
-        synchronized (ppgLock) { ppgBuf.clear(); }
+        synchronized (ppgLock) { ppgBuf.clear(); spo2Buf.clear(); }
         android.util.Log.i(TAG, "sampling window closed");
     }
 
@@ -188,33 +212,149 @@ public class BridgeService extends Service implements SensorEventListener {
     }
 
     void handle(Socket client) {
+        OutputStream out = null;
         try {
-            OutputStream out = client.getOutputStream();
+            out = client.getOutputStream();
+            clientOuts.add(out);
+            BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream()));
+            // 读命令线程（手机→手表：RECORDS/MEASURE/CONFIG）
+            Thread reader = new Thread(() -> readLoop(client, in, out), "reader-" + client.getPort());
+            reader.start();
+            // 写数据循环（每 3 秒推送状态）
             SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US);
-                f.setTimeZone(TimeZone.getDefault());
-                while (!client.isClosed()) {
-                    computeHrFromPpg();   // PPG 自相关估计心率
-                    float hr = latestHeartRate;
-                    long hrAge = lastHrAt == 0 ? -1 : System.currentTimeMillis() - lastHrAt;
-                    String json = "{\"hr\":" + (hrAge >= 0 && hrAge < 120000 ? (int) hr : 0)
-                            + ",\"steps\":" + (int) cumulativeSteps
-                            + ",\"spo2Raw\":" + (int) lastSpo2
-                            + ",\"worn\":" + (worn ? 1 : 0)
-                            + ",\"hrAgeMs\":" + hrAge
+            f.setTimeZone(TimeZone.getDefault());
+            while (!client.isClosed()) {
+                computeHrFromPpg();   // PPG 自相关估计心率
+                float hr = latestHeartRate;
+                long hrAge = lastHrAt == 0 ? -1 : System.currentTimeMillis() - lastHrAt;
+                String json = "{\"hr\":" + (hrAge >= 0 && hrAge < 120000 ? (int) hr : 0)
+                        + ",\"steps\":" + (int) cumulativeSteps
+                        + ",\"spo2Raw\":" + (int) lastSpo2
+                        + ",\"spo2\":" + (int) lastSpo2Pct
+                        + ",\"worn\":" + (worn ? 1 : 0)
+                        + ",\"hrAgeMs\":" + hrAge
                         + ",\"hk\":\"" + HealthKitClient.lastStatus.replace("\"", "'")
                         + "\",\"clients\":" + activeClients.get()
                         + ",\"ts\":\"" + f.format(new Date()) + "\"}\n";
-                out.write(json.getBytes());
-                out.flush();
+                synchronized (out) {
+                    out.write(json.getBytes());
+                    out.flush();
+                }
                 Thread.sleep(3000);
             }
         } catch (Exception e) {
             android.util.Log.w(TAG, "handle error: " + e);
         } finally {
             activeClients.decrementAndGet();
+            if (out != null) clientOuts.remove(out);
             try { client.close(); } catch (IOException ignored) {}
         }
     }
+
+    void readLoop(Socket client, BufferedReader in, OutputStream out) {
+        try {
+            String line;
+            while (!client.isClosed() && (line = in.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                android.util.Log.i(TAG, "cmd: " + line);
+                if (line.startsWith("RECORDS")) {
+                    byte[] data = recordStore.serialize().getBytes();
+                    synchronized (out) { out.write(data); out.flush(); }
+                } else if (line.startsWith("MEASURE")) {
+                    Object[] r = doMeasure();
+                    long now = System.currentTimeMillis();
+                    float hr = (Float) r[0];
+                    float spo2 = (Float) r[1];
+                    if (hr > 0) recordStore.appendHr(now, hr);
+                    if (spo2 > 0) recordStore.appendSpo2(now, spo2);
+                    recordStore.save();
+                    String resp = "{\"type\":\"measure\",\"hr\":" + (int) hr
+                            + ",\"spo2\":" + (int) spo2
+                            + ",\"worn\":" + (worn ? 1 : 0)
+                            + ",\"ts\":" + now + "}\n";
+                    synchronized (out) { out.write(resp.getBytes()); out.flush(); }
+                } else if (line.startsWith("CONFIG")) {
+                    applyConfig(line);
+                    String resp = "{\"type\":\"config\",\"hrInterval\":" + hrIntervalSec
+                            + ",\"spo2Interval\":" + spo2IntervalSec + "}\n";
+                    synchronized (out) { out.write(resp.getBytes()); out.flush(); }
+                }
+            }
+        } catch (Exception e) {
+            android.util.Log.w(TAG, "readLoop error: " + e);
+        }
+    }
+
+    void applyConfig(String line) {
+        try {
+            android.content.SharedPreferences p = getSharedPreferences("bridge", MODE_PRIVATE);
+            android.content.SharedPreferences.Editor e = p.edit();
+            for (String tok : line.split("\\s+")) {
+                if (tok.startsWith("hrInterval=")) {
+                    hrIntervalSec = Math.max(15, Long.parseLong(tok.substring(11)));
+                    e.putLong("hrInterval", hrIntervalSec);
+                } else if (tok.startsWith("spo2Interval=")) {
+                    spo2IntervalSec = Math.max(15, Long.parseLong(tok.substring(13)));
+                    e.putLong("spo2Interval", spo2IntervalSec);
+                }
+            }
+            e.apply();
+            android.util.Log.i(TAG, "config hrInterval=" + hrIntervalSec + " spo2Interval=" + spo2IntervalSec);
+        } catch (Throwable t) {
+            android.util.Log.w(TAG, "applyConfig: " + t);
+        }
+    }
+
+    /** 手动测量（立即采样 10 秒并返回结果） */
+    Object[] doMeasure() {
+        if (!sampling) {
+            startSampling();
+            sleep(10000);
+            computeHrFromPpg();
+            computeSpo2();
+            stopSampling();
+        } else {
+            computeHrFromPpg();
+            computeSpo2();
+        }
+        float hr = lastHrAt > 0 && System.currentTimeMillis() - lastHrAt < 60000 ? latestHeartRate : 0f;
+        return new Object[]{hr, lastSpo2Pct};
+    }
+
+    /** 手表→手机命令广播（短视频遥控等） */
+    public static void sendAll(String cmd) {
+        for (OutputStream out : clientOuts) {
+            try {
+                synchronized (out) { out.write(cmd.getBytes()); out.flush(); }
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    /** 采样窗口结束落库（force=true 手动测量立即记录） */
+    void recordMeasurements(boolean force) {
+        try {
+            long now = System.currentTimeMillis();
+            if (!worn && !force) return;
+            if (lastHrAt > 0 && now - lastHrAt < 60000) {
+                if (force || now - lastHrRecordAt >= hrIntervalSec * 1000) {
+                    recordStore.appendHr(now, latestHeartRate);
+                    lastHrRecordAt = now;
+                }
+            }
+            if (lastSpo2Pct > 0) {
+                if (force || now - lastSpo2RecordAt >= spo2IntervalSec * 1000) {
+                    recordStore.appendSpo2(now, lastSpo2Pct);
+                    lastSpo2RecordAt = now;
+                }
+            }
+            recordStore.save();
+        } catch (Throwable t) {
+            android.util.Log.w(TAG, "recordMeasurements: " + t);
+        }
+    }
+    volatile long lastHrRecordAt = 0;
+    volatile long lastSpo2RecordAt = 0;
 
     static void sleep(long ms) {
         try { Thread.sleep(ms); } catch (InterruptedException ignored) {}
@@ -238,6 +378,13 @@ public class BridgeService extends Service implements SensorEventListener {
             cumulativeSteps = event.values[0];
         } else if (type == 65596) {
             lastSpo2 = event.values[0];
+            if (event.values.length >= 2) {
+                synchronized (ppgLock) {
+                    float ts = event.timestamp / 1000000000f;
+                    spo2Buf.addLast(new float[]{ts, event.values[0], event.values[1]});
+                    while (spo2Buf.size() > SPO2_BUF_MAX) spo2Buf.removeFirst();
+                }
+            }
         } else if (type == 34 /* LOW_LATENCY_OFFBODY_DETECT */) {
             worn = event.values[0] > 0.5f;
             android.util.Log.i(TAG, "offbody worn=" + worn);
@@ -335,6 +482,53 @@ public class BridgeService extends Service implements SensorEventListener {
         } else {
             android.util.Log.i(TAG, "ppg-hr out of range: " + bpm);
         }
+    }
+
+    // ---------------- PPG 合成血氧估计 ----------------
+    // max86178_spo2 双通道（红/红外原始值）：R=(AC1/DC1)/(AC2/DC2)，SpO2≈110-25R
+    // 通道角色未知 → 两个方向都算，取落在 85-100 的候选；结果限幅 [88,100]
+    void computeSpo2() {
+        float[][] d;
+        synchronized (ppgLock) {
+            if (spo2Buf.size() < 30) return;      // <6 秒数据不算
+            d = spo2Buf.toArray(new float[0][]);
+        }
+        int m = d.length;
+        float[] c0 = new float[m], c1 = new float[m];
+        float dc0 = 0, dc1 = 0;
+        for (int i = 0; i < m; i++) { c0[i] = d[i][1]; c1[i] = d[i][2]; dc0 += c0[i]; dc1 += c1[i]; }
+        dc0 /= m; dc1 /= m;
+        if (dc0 < 1 || dc1 < 1) return;
+        // AC = 去趋势（3 秒滑动均值）后的 RMS
+        float ac0 = rmsDetrended(c0), ac1 = rmsDetrended(c1);
+        if (ac0 <= 0 || ac1 <= 0) return;
+        float r01 = (ac0 / dc0) / (ac1 / dc1);
+        float r10 = (ac1 / dc1) / (ac0 / dc0);
+        float best = 0;
+        float s01 = 110f - 25f * r01;
+        float s10 = 110f - 25f * r10;
+        if (s01 >= 85 && s01 <= 100) best = s01;
+        if (best == 0 && s10 >= 85 && s10 <= 100) best = s10;
+        if (best == 0) { android.util.Log.i(TAG, "spo2 candidate out of range: " + s01 + "/" + s10); return; }
+        if (best < 88) best = 88;
+        if (best > 100) best = 100;
+        // 平滑：与上次值差异过大时取均值过渡
+        if (lastSpo2Pct > 0 && Math.abs(best - lastSpo2Pct) > 5) best = (best + lastSpo2Pct) / 2;
+        lastSpo2Pct = best;
+        android.util.Log.i(TAG, "ppg-spo2=" + (int) best + " ac0=" + (int) ac0 + " ac1=" + (int) ac1);
+    }
+
+    float rmsDetrended(float[] x) {
+        int m = x.length;
+        float energy = 0;
+        for (int i = 0; i < m; i++) {
+            int a = Math.max(0, i - 7), b = Math.min(m - 1, i + 7);
+            float lm = 0;
+            for (int j = a; j <= b; j++) lm += x[j];
+            float v = x[i] - lm / (b - a + 1);
+            energy += v * v;
+        }
+        return (float) Math.sqrt(energy / m);
     }
 
     @Override
